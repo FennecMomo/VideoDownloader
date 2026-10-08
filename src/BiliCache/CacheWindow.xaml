@@ -1,0 +1,38 @@
+<Window x:Class="BiliCache.CacheWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="clr-namespace:BiliCache"
+ Title="BiliCache · 哔哩缓存" Width="1120" Height="790" MinWidth="940" MinHeight="700" Background="#F4F6FA" FontFamily="Microsoft YaHei UI" Foreground="#172239" Closing="Window_Closing" Loaded="Window_Loaded">
+ <Window.Resources>
+  <Style TargetType="Button"><Setter Property="Padding" Value="17,9"/><Setter Property="Margin" Value="0,0,8,0"/><Setter Property="Background" Value="#EAF0FA"/><Setter Property="Foreground" Value="#244775"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/>
+   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="Surface" CornerRadius="7" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Surface" Property="Opacity" Value="0.8"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="Surface" Property="Opacity" Value="0.42"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+  </Style>
+  <Style TargetType="TextBox"><Setter Property="Padding" Value="10,9"/><Setter Property="BorderBrush" Value="#D8DFE9"/><Setter Property="VerticalContentAlignment" Value="Center"/></Style>
+  <Style TargetType="ComboBox"><Setter Property="Padding" Value="8"/><Setter Property="VerticalContentAlignment" Value="Center"/></Style>
+ </Window.Resources>
+ <Grid Margin="28,24"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <Grid Margin="0,0,0,22"><StackPanel><TextBlock Text="BiliCache" FontSize="29" FontWeight="Bold"/><TextBlock Text="先缓存，再畅看。把喜欢的视频留在电脑里。" Foreground="#748095" Margin="0,5,0,0"/></StackPanel><TextBlock x:Name="EngineStatus" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="#59718D" Text="检查下载组件…"/></Grid>
+  <Border x:Name="NewCacheCard" Grid.Row="1" Background="White" CornerRadius="12" Padding="22" Margin="0,0,0,18"><StackPanel>
+   <TextBlock Text="新建缓存" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,13"/>
+   <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBox x:Name="UrlBox" ToolTip="粘贴 Bilibili 普通视频或 b23.tv 链接" TextChanged="UrlBox_TextChanged"/><Button x:Name="AnalyzeButton" Grid.Column="1" Content="解析视频" Click="Analyze_Click" Background="#3975EB" Foreground="White" Margin="12,0,0,0"/><Button x:Name="CancelAnalyzeButton" Grid.Column="2" Content="取消" Click="CancelAnalyze_Click" Margin="8,0,0,0" Visibility="Collapsed"/></Grid>
+   <TextBlock x:Name="VideoTitle" Text="粘贴 B 站视频链接，解析后选择缓存清晰度" FontSize="16" FontWeight="SemiBold" Margin="0,17,0,5" TextTrimming="CharacterEllipsis"/>
+   <TextBlock x:Name="VideoMeta" Text="支持普通视频及指定分P · 暂不支持整合集和番剧" Foreground="#748095" Margin="0,0,0,14"/>
+   <StackPanel Orientation="Horizontal"><TextBlock Text="缓存清晰度" VerticalAlignment="Center" Margin="0,0,12,0"/><ComboBox x:Name="QualityBox" Width="180" DisplayMemberPath="Label" IsEnabled="False"/><Button x:Name="AddButton" Content="加入缓存队列" Click="Add_Click" IsEnabled="False" Margin="14,0,0,0" Background="#3975EB" Foreground="White"/><TextBlock Text="MP4 · 自动合并音视频" VerticalAlignment="Center" Foreground="#748095" Margin="16,0,0,0"/></StackPanel>
+  </StackPanel></Border>
+  <TabControl x:Name="MainTabs" Grid.Row="2" Background="Transparent" BorderThickness="0" SelectionChanged="MainTabs_SelectionChanged">
+   <TabItem Header="  缓存列表  "><Grid Margin="0,14,0,0"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <ListView x:Name="JobsList" ItemsSource="{Binding Jobs}" BorderThickness="0" Background="White" ScrollViewer.HorizontalScrollBarVisibility="Disabled" HorizontalContentAlignment="Stretch"><ListView.ItemContainerStyle><Style TargetType="ListViewItem"><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Padding" Value="15,12"/><Setter Property="Margin" Value="0,0,0,5"/></Style></ListView.ItemContainerStyle><ListView.ItemTemplate><DataTemplate><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="95"/></Grid.ColumnDefinitions><StackPanel><TextBlock Text="{Binding Title}" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/><TextBlock Text="{Binding Quality}" FontSize="11" Foreground="#748095" Margin="0,4,0,6"/><ProgressBar Value="{Binding Progress}" Maximum="100" Height="5" Foreground="#3975EB" Background="#E8EEF7" BorderThickness="0"/><TextBlock Text="{Binding Detail}" Foreground="#748095" FontSize="12" Margin="0,7,0,0" TextTrimming="CharacterEllipsis" MaxHeight="35" ToolTip="{Binding Detail}"/></StackPanel><TextBlock Grid.Column="1" Text="{Binding State}" HorizontalAlignment="Right" Foreground="#3975EB" VerticalAlignment="Center"/></Grid></DataTemplate></ListView.ItemTemplate></ListView>
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,13,0,0"><Button Content="播放选中视频" Click="Play_Click" Background="#3975EB" Foreground="White"/><Button Content="打开文件夹" Click="OpenFolder_Click"/><Button Content="重试 / 继续" Click="Retry_Click"/><Button Content="取消缓存" Click="CancelJob_Click"/><Button Content="移除记录" Click="Remove_Click"/></StackPanel>
+   </Grid></TabItem>
+   <TabItem x:Name="PlayerTab" Header="  本地播放器  "><local:LocalPlayer x:Name="Player"/></TabItem>
+   <TabItem Header="  设置  "><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="20">
+    <TextBlock Text="高清缓存 / B站登录" FontWeight="SemiBold" Margin="0,0,0,8"/>
+    <WrapPanel><Button Content="登录 B站 / 重新登录" Click="Login_Click"/><Button Content="退出工具内账号" Click="Logout_Click"/><TextBlock x:Name="AccountStatus" Text="未登录 · 使用公开清晰度" VerticalAlignment="Center" Foreground="#59718D"/></WrapPanel>
+    <TextBlock Text="在官方页面完成登录后自动保存账号，并刷新当前视频的清晰度。下次打开工具继续使用，失效时重新登录即可。" TextWrapping="Wrap" Foreground="#748095" Margin="0,8,0,14"/>
+    <TextBlock Text="缓存保存位置" FontWeight="SemiBold" Margin="0,0,0,8"/><DockPanel><Button Content="选择文件夹" DockPanel.Dock="Right" Click="BrowseDownloads_Click" Margin="10,0,0,0"/><TextBox x:Name="DownloadFolderBox"/></DockPanel>
+    <TextBlock Text="Cookie 文件（可选）" FontWeight="SemiBold" Margin="0,17,0,8"/><DockPanel><Button Content="选择文件" DockPanel.Dock="Right" Click="BrowseCookies_Click" Margin="10,0,0,0"/><TextBox x:Name="CookieBox"/></DockPanel>
+    <TextBlock Text="高级选项：导入自己的 Netscape 格式 B站 Cookie，优先于上面的登录会话。通常直接使用登录窗口即可，文件可留空。" TextWrapping="Wrap" Foreground="#748095" Margin="0,6,0,0"/>
+    <TextBlock Text="下载组件目录" FontWeight="SemiBold" Margin="0,17,0,8"/><DockPanel><Button Content="选择文件夹" DockPanel.Dock="Right" Click="BrowseTools_Click" Margin="10,0,0,0"/><TextBox x:Name="ToolsBox"/></DockPanel>
+    <TextBlock Text="包含 yt-dlp.exe、ffmpeg.exe、ffprobe.exe；留空时自动查找随程序提供的 tools 目录。" TextWrapping="Wrap" Foreground="#748095" Margin="0,6,0,14"/><Button Content="保存设置" HorizontalAlignment="Left" Click="SaveSettings_Click"/>
+   </StackPanel></ScrollViewer></TabItem>
+  </TabControl>
+  <TextBlock Grid.Row="3" x:Name="StatusText" Text="就绪 · 缓存完成后无需网络即可播放" Foreground="#64748B" Margin="0,16,0,0" TextWrapping="Wrap" MaxHeight="42"/>
+ </Grid>
+</Window>
