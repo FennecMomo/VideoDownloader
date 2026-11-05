@@ -3,6 +3,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace BiliCache;
@@ -66,17 +67,6 @@ public sealed class DownloadService
         return root;
     }
 
-    private static List<string> Common(Settings settings)
-    {
-        var args = new List<string> { "--ignore-config", "--no-plugin-dirs", "--no-playlist", "--no-colors", "--encoding", "utf-8", "--socket-timeout", "20", "--retries", "3", "--extractor-retries", "2" };
-        if (!string.IsNullOrWhiteSpace(settings.CookieFile))
-        {
-            if (!File.Exists(settings.CookieFile)) throw new FileNotFoundException("配置的 Cookie 文件不存在，请重新选择或清空。");
-            args.AddRange(["--cookies", settings.CookieFile]);
-        }
-        return args;
-    }
-
     public async Task<VideoInfo> AnalyzeAsync(string input, Settings settings, CancellationToken cancellationToken)
     {
         ValidateTools(settings);
@@ -86,57 +76,201 @@ public sealed class DownloadService
     public async Task<string> DownloadAsync(CacheJob job, Settings settings, IProgress<DownloadUpdate> progress, CancellationToken cancellationToken)
     {
         string root = ValidateTools(settings);
-        Directory.CreateDirectory(job.Folder);
-        var args = Common(settings);
-        string filter = job.Height > 0 ? $"[height<={job.Height}]" : "";
-        progress.Report(new DownloadUpdate(0, "正在通过浏览器解析视频…"));
-        var source = await ResolveBrowserAsync(NormalizeUrl(job.Url), settings, cancellationToken);
-        string infoPath = Path.Combine(job.Folder, ".download-info.json");
-        await File.WriteAllTextAsync(infoPath, source.DownloadJson, cancellationToken);
-        args.AddRange(["--load-info-json", infoPath]);
-        args.AddRange(["--ffmpeg-location", root, "--windows-filenames", "--continue", "--newline", "--progress", "--no-simulate",
-            "--progress-template", "download:PROGRESS:%(progress)j", "--print", "after_move:FILE:%(filepath)j",
-            "-f", $"bv{filter}+ba/b{filter}", "-S", "vcodec:h264,acodec:aac", "--merge-output-format", "mp4", "--remux-video", "mp4",
-            "-o", Path.Combine(job.Folder, "%(title).120B [%(id)s].%(ext)s")]);
-        string? file = null;
+        if (!string.IsNullOrWhiteSpace(settings.CookieFile) && !File.Exists(settings.CookieFile))
+            throw new FileNotFoundException("配置的 Cookie 文件不存在，请重新选择或清空。");
+        progress.Report(new DownloadUpdate(job.Progress, "正在通过浏览器解析视频…"));
+        ResolvedVideo source;
         try
         {
-        await RunAsync(Path.Combine(root, "yt-dlp.exe"), args, line =>
+            source = await ResolveBrowserAsync(NormalizeUrl(job.Url), settings, cancellationToken);
+        }
+        finally { resolved.Clear(); }
+        return await Task.Run(() => DownloadResolvedAsync(root, job, source, progress, cancellationToken), cancellationToken);
+    }
+
+    internal static async Task<string> DownloadResolvedAsync(string root, CacheJob job, ResolvedVideo source,
+        IProgress<DownloadUpdate> progress, CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(job.Folder);
+        string outputSuffix = $" [{source.ContentId}].mp4";
+        var existing = Directory.EnumerateFiles(job.Folder).Where(path =>
+            path.EndsWith(outputSuffix, StringComparison.OrdinalIgnoreCase)).Take(2).ToArray();
+        if (existing.Length == 1 && await ReuseOutputAsync(root, existing[0], source.Info.Duration, progress, cancellationToken))
+            return Path.GetFullPath(existing[0]);
+
+        var selection = await SelectTracksAsync(root, job, source, cancellationToken);
+        string file = selection.File;
+        if (File.Exists(file) && await ReuseOutputAsync(root, file, source.Info.Duration, progress, cancellationToken)) return file;
+
+        string videoPath = await MediaTransfer.FetchAsync(job.Folder, source, selection.Video, (done, total) =>
+            ReportTransfer(progress, "视频", done, total), cancellationToken);
+        string audioPath = await MediaTransfer.FetchAsync(job.Folder, source, selection.Audio, (done, total) =>
+            ReportTransfer(progress, "音频", done, total), cancellationToken);
+        string mergePath = Path.Combine(job.Folder, ".merge-" + Guid.NewGuid().ToString("N") + ".mp4");
+        try
         {
-            if (line.StartsWith("FILE:")) file = JsonSerializer.Deserialize<string>(line[5..]);
-            else if (line.StartsWith("PROGRESS:"))
-            {
-                try
+            progress.Report(new DownloadUpdate(99, "正在合并音视频，请稍候…"));
+            await RunAsync(Path.Combine(root, "ffmpeg.exe"),
+                ["-hide_banner", "-loglevel", "error", "-nostdin", "-i", videoPath, "-i", audioPath,
+                    "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", mergePath],
+                _ => { }, cancellationToken);
+            progress.Report(new DownloadUpdate(99, "正在检查本地音视频文件…"));
+            await VerifyMediaAsync(root, mergePath, cancellationToken, source.Info.Duration);
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(mergePath, file);
+        }
+        catch (DownloadProcessException ex) when (IsInvalidMedia(ex))
+        {
+            await QuarantineInvalidTrackAsync(root, videoPath, "v:0", "video", cancellationToken);
+            await QuarantineInvalidTrackAsync(root, audioPath, "a:0", "audio", cancellationToken);
+            throw;
+        }
+        finally { TryDeleteTemporary(mergePath); }
+        TryDeleteTemporary(videoPath);
+        TryDeleteTemporary(videoPath + ".length");
+        TryDeleteTemporary(audioPath);
+        TryDeleteTemporary(audioPath + ".length");
+        return file;
+    }
+
+    private static async Task QuarantineInvalidTrackAsync(string root, string file, string stream, string kind, CancellationToken token)
+    {
+        bool hasTrack = false;
+        try
+        {
+            await RunAsync(Path.Combine(root, "ffprobe.exe"),
+                ["-v", "error", "-select_streams", stream, "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", file],
+                line => hasTrack |= line == kind, token);
+        }
+        catch (DownloadProcessException ex) when (IsInvalidMedia(ex)) { hasTrack = false; }
+        catch (DownloadProcessException) { return; }
+
+        token.ThrowIfCancellationRequested();
+        if (hasTrack) return;
+        File.Move(file, file + ".invalid-" + Guid.NewGuid().ToString("N"));
+        TryDeleteTemporary(file + ".length");
+    }
+
+    private static async Task<bool> ReuseOutputAsync(string root, string file, double duration,
+        IProgress<DownloadUpdate> progress, CancellationToken token)
+    {
+        try
+        {
+            progress.Report(new DownloadUpdate(99, "正在检查已有缓存文件…"));
+            if (new FileInfo(file).Length == 0) throw new InvalidMediaException("缓存文件为空。");
+            await VerifyMediaAsync(root, file, token, duration);
+            return true;
+        }
+        catch (Exception ex) when (IsInvalidMedia(ex))
+        {
+            token.ThrowIfCancellationRequested();
+            File.Move(file, file + ".invalid-" + Guid.NewGuid().ToString("N"));
+            return false;
+        }
+    }
+
+    private static async Task<(MediaTrack Video, MediaTrack Audio, string File)> SelectTracksAsync(
+        string root, CacheJob job, ResolvedVideo source, CancellationToken token)
+    {
+        string selectionPath = Path.Combine(job.Folder, ".media-selection.json");
+        var saved = await LoadSelectionAsync(selectionPath, token);
+        string? videoId = null, audioId = null, file = null;
+        string filter = job.Height > 0 ? $"[height<={job.Height}]" : "";
+        string formats = $"bv{filter}+ba/b{filter}";
+        if (saved != null)
+        {
+            var matchingVideo = source.Tracks.FirstOrDefault(track => MediaTransfer.TrackKey(track) == saved.Video);
+            var matchingAudio = source.Tracks.FirstOrDefault(track => MediaTransfer.TrackKey(track) == saved.Audio);
+            if (matchingVideo == null || matchingAudio == null)
+                throw new DownloadInterruptedException("当前地址未返回此任务已选的音视频轨道，原有片段已保留。");
+            formats = $"{matchingVideo.FormatId}+{matchingAudio.FormatId}";
+        }
+
+        string infoPath = Path.Combine(job.Folder, ".download-info-" + Guid.NewGuid().ToString("N") + ".json");
+        var info = JsonNode.Parse(source.DownloadJson)!.AsObject();
+        if (!string.IsNullOrWhiteSpace(job.Title)) info["title"] = job.Title;
+        try
+        {
+            await File.WriteAllTextAsync(infoPath, info.ToJsonString(), token);
+            await RunAsync(Path.Combine(root, "yt-dlp.exe"),
+                ["--ignore-config", "--no-plugin-dirs", "--encoding", "utf-8", "--ffmpeg-location", root, "--load-info-json", infoPath,
+                    "--windows-filenames", "--simulate", "--print", "TRACKS:%(requested_formats)j", "--print", "OUTPUT:%(filename)j",
+                    "-f", formats, "-S", "vcodec:h264,acodec:aac", "--merge-output-format", "mp4",
+                    "-o", Path.Combine(job.Folder, "%(title).120B [%(id)s].%(ext)s")],
+                line =>
                 {
-                    using var doc = JsonDocument.Parse(line[9..]);
-                    var p = doc.RootElement;
-                    double total = Number(p, "total_bytes");
-                    if (total <= 0) total = Number(p, "total_bytes_estimate");
-                    double done = Number(p, "downloaded_bytes");
-                    double percent = total > 0 ? Math.Clamp(done / total * 100, 0, 100) : 0;
-                    string detail = Text(p, "status") == "finished" ? "当前媒体流已下载，正在处理后续轨道或合并…" : $"{percent:F1}% · {Number(p, "speed") / 1048576:F2} MB/s · 剩余约 {Number(p, "eta"):F0} 秒";
-                    progress.Report(new DownloadUpdate(Math.Min(percent, 99), detail));
-                }
-                catch (JsonException) { /* Ignore non-machine progress lines. */ }
-            }
-            else if (line.StartsWith("[Merger]") || line.StartsWith("[VideoRemuxer]"))
-                progress.Report(new DownloadUpdate(99, "正在合并音视频，请稍候…"));
-        }, cancellationToken);
+                    if (line.StartsWith("OUTPUT:", StringComparison.Ordinal))
+                        file = JsonSerializer.Deserialize<string>(line[7..]);
+                    if (!line.StartsWith("TRACKS:[", StringComparison.Ordinal)) return;
+                    using var tracks = JsonDocument.Parse(line[7..]);
+                    foreach (var track in tracks.RootElement.EnumerateArray())
+                    {
+                        string id = Text(track, "format_id");
+                        if (id.StartsWith("video-", StringComparison.Ordinal)) videoId = id;
+                        else if (id.StartsWith("audio-", StringComparison.Ordinal)) audioId = id;
+                    }
+                }, token);
         }
         finally
         {
-            if (File.Exists(infoPath)) File.Delete(infoPath);
-            resolved.Clear();
+            TryDeleteTemporary(infoPath);
         }
-        cancellationToken.ThrowIfCancellationRequested();
-        if (string.IsNullOrWhiteSpace(file)) throw new IOException("下载进程结束，但没有返回最终文件路径。");
+
+        var video = source.Tracks.FirstOrDefault(track => track.FormatId == videoId);
+        var audio = source.Tracks.FirstOrDefault(track => track.FormatId == audioId);
+        if (video == null || audio == null || string.IsNullOrWhiteSpace(file))
+            throw new IOException("下载组件未能选定完整的音视频轨道。");
         file = Path.GetFullPath(file);
         string allowed = Path.GetFullPath(job.Folder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!file.StartsWith(allowed, StringComparison.OrdinalIgnoreCase) || !File.Exists(file) || new FileInfo(file).Length == 0)
-            throw new IOException("没有找到完整的缓存文件，请重试。");
-        progress.Report(new DownloadUpdate(99, "正在检查本地音视频文件…"));
-        await VerifyMediaAsync(root, file, cancellationToken, source.Info.Duration);
-        return file;
+        if (!file.StartsWith(allowed, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("下载组件返回的缓存路径不在任务目录内。");
+        if (saved == null)
+            await SaveSelectionAsync(selectionPath, new TrackSelection(MediaTransfer.TrackKey(video), MediaTransfer.TrackKey(audio)), token);
+        return (video, audio, file);
+    }
+
+    private sealed record TrackSelection(string Video, string Audio);
+
+    private static async Task<TrackSelection?> LoadSelectionAsync(string file, CancellationToken token)
+    {
+        if (!File.Exists(file)) return null;
+        try
+        {
+            var selection = JsonSerializer.Deserialize<TrackSelection>(await File.ReadAllTextAsync(file, token));
+            if (selection?.Video is { Length: 24 } && selection.Audio is { Length: 24 }) return selection;
+            throw new JsonException("轨道标识缺失。");
+        }
+        catch (JsonException ex) { throw new IOException("缓存任务的轨道记录损坏，原有片段已保留。", ex); }
+    }
+
+    private static async Task SaveSelectionAsync(string file, TrackSelection selection, CancellationToken token)
+    {
+        string temporary = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(selection), token);
+            token.ThrowIfCancellationRequested();
+            File.Move(temporary, file);
+        }
+        finally { TryDeleteTemporary(temporary); }
+    }
+
+    private static void ReportTransfer(IProgress<DownloadUpdate> progress, string track, long done, long total) =>
+        progress.Report(new DownloadUpdate(Math.Min(99, (double)done / total * 100),
+            $"正在缓存{track} · {done / 1048576d:F1} / {total / 1048576d:F1} MB"));
+
+    private sealed class InvalidMediaException(string message) : IOException(message);
+
+    private static bool IsInvalidMedia(Exception error) => error is InvalidMediaException ||
+        error is DownloadProcessException process &&
+        (process.Diagnostic.Contains("Invalid data found", StringComparison.OrdinalIgnoreCase) ||
+            process.Diagnostic.Contains("moov atom not found", StringComparison.OrdinalIgnoreCase));
+
+    internal static void TryDeleteTemporary(string file)
+    {
+        try { File.Delete(file); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     public static async Task VerifyMediaAsync(string toolsRoot, string file, CancellationToken cancellationToken, double expectedDuration = 0)
@@ -146,44 +280,13 @@ public sealed class DownloadService
         using var doc = JsonDocument.Parse(result.ToString());
         var types = doc.RootElement.GetProperty("streams").EnumerateArray().Select(s => Text(s, "codec_type")).ToList();
         if (!types.Contains("video") || !types.Contains("audio") || Number(doc.RootElement.GetProperty("format"), "duration") <= 0)
-            throw new IOException("缓存文件未通过检查：需要有效的视频、音频和时长。");
+            throw new InvalidMediaException("缓存文件未通过检查：需要有效的视频、音频和时长。");
         if (expectedDuration > 0 && Math.Abs(Number(doc.RootElement.GetProperty("format"), "duration") - expectedDuration) > 3)
-            throw new IOException("缓存文件时长与原视频不一致，未标记完成，请重新缓存。");
+            throw new InvalidMediaException("缓存文件时长与原视频不一致，未标记完成，请重新缓存。");
     }
 
-    internal static async Task RunAsync(string exe, IEnumerable<string> arguments, Action<string> onLine, CancellationToken cancellationToken)
-    {
-        var start = new ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8 };
-        foreach (string argument in arguments) start.ArgumentList.Add(argument);
-        using var process = new Process { StartInfo = start };
-        cancellationToken.ThrowIfCancellationRequested();
-        process.Start();
-        using var registration = cancellationToken.Register(() => { try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { } });
-        var errors = new Queue<string>();
-        async Task ReadErrors()
-        {
-            while (await process.StandardError.ReadLineAsync() is { } line)
-            {
-                if (errors.Count >= 12) errors.Dequeue();
-                errors.Enqueue(line);
-            }
-        }
-        async Task ReadOutput()
-        {
-            while (await process.StandardOutput.ReadLineAsync() is { } line) onLine(line);
-        }
-        try
-        {
-            await Task.WhenAll(ReadOutput(), ReadErrors(), process.WaitForExitAsync());
-            cancellationToken.ThrowIfCancellationRequested();
-            if (process.ExitCode != 0)
-                throw new InvalidOperationException(FriendlyError(string.Join(Environment.NewLine, errors)));
-        }
-        finally
-        {
-            if (!process.HasExited) { process.Kill(true); await process.WaitForExitAsync(); }
-        }
-    }
+    internal static Task RunAsync(string exe, IEnumerable<string> arguments, Action<string> onLine, CancellationToken cancellationToken) =>
+        ToolProcess.RunAsync(exe, arguments, onLine, cancellationToken);
 
     public static string FriendlyError(string message)
     {

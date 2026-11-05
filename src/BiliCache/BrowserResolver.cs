@@ -1,4 +1,6 @@
 using System.IO;
+using System.Net;
+using System.Net.Http;
 using System.Text.Json;
 using System.Windows;
 using Microsoft.Web.WebView2.Core;
@@ -6,12 +8,18 @@ using Microsoft.Web.WebView2.Wpf;
 
 namespace BiliCache;
 
-public sealed record ResolvedVideo(VideoInfo Info, string DownloadJson);
+public sealed record ResolvedVideo(VideoInfo Info, string DownloadJson)
+{
+    internal string ContentId { get; init; } = "";
+    internal string UserAgent { get; init; } = "";
+    internal IReadOnlyList<MediaTrack> Tracks { get; init; } = [];
+}
 
 /// <summary>Loads the real video page in the application's isolated browser session.</summary>
 public sealed class BrowserResolver
 {
     private static readonly SemaphoreSlim Gate = new(1, 1);
+    private static readonly TimeSpan BrowserOperationTimeout = TimeSpan.FromSeconds(30);
     public static string ProfilePath(string cookieFile, bool useAccountSession) => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "BiliCache", !string.IsNullOrWhiteSpace(cookieFile) ? "AccountProfile" : useAccountSession ? "SignedInProfile" : "BrowserProfile");
 
     public async Task<ResolvedVideo> ResolveAsync(string input, string cookieFile, CancellationToken cancellationToken, bool useAccountSession = false)
@@ -20,23 +28,37 @@ public sealed class BrowserResolver
         await Gate.WaitAsync(cancellationToken);
         WebView2? browser = null;
         Window? host = null;
+        bool closingBrowser = false;
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             browser = new WebView2();
             host = new Window { Width = 1000, Height = 720, Content = browser, ShowActivated = false, ShowInTaskbar = false, Opacity = 0, WindowStyle = WindowStyle.None, Title = "BiliCache 页面解析" };
             host.Show();
             // Keep anonymous browsing separate from explicitly imported account cookies.
             string profile = ProfilePath(cookieFile, useAccountSession);
-            var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: profile);
-            await browser.EnsureCoreWebView2Async(environment);
-            cancellationToken.ThrowIfCancellationRequested();
+            var environment = await WaitForBrowserAsync(CoreWebView2Environment.CreateAsync(userDataFolder: profile), cancellationToken);
+            await WaitForBrowserAsync(browser.EnsureCoreWebView2Async(environment), cancellationToken);
             if (!string.IsNullOrWhiteSpace(cookieFile)) ImportCookies(browser.CoreWebView2, cookieFile);
             else if (useAccountSession)
             {
                 var session = new AccountSession();
-                await session.RestoreAsync(browser.CoreWebView2);
-                var cookies = await AccountSession.CaptureAsync(browser.CoreWebView2);
-                var account = await AccountSession.VerifyAsync(cookies, browser.CoreWebView2.Settings.UserAgent, cancellationToken);
+                await session.RestoreAsync(browser.CoreWebView2, cancellationToken);
+                var cookies = await AccountSession.CaptureAsync(browser.CoreWebView2, cancellationToken);
+                AccountIdentity? account;
+                try
+                {
+                    account = await AccountSession.VerifyAsync(cookies, browser.CoreWebView2.Settings.UserAgent, cancellationToken);
+                }
+                catch (TimeoutException ex)
+                {
+                    throw new DownloadInterruptedException(ex.Message, ex);
+                }
+                catch (HttpRequestException ex) when (ex.StatusCode is null or HttpStatusCode.RequestTimeout or >= HttpStatusCode.InternalServerError)
+                {
+                    throw new DownloadInterruptedException(ex.Message, ex);
+                }
+                cancellationToken.ThrowIfCancellationRequested();
                 if (account == null) throw new LoginExpiredException();
                 session.Save(new SavedSession(account, cookies));
             }
@@ -62,24 +84,34 @@ public sealed class BrowserResolver
             string lastPage = "尚未加载";
             string navigationStatus = "等待导航";
             bool? navigationSucceeded = null;
-            browser.CoreWebView2.NavigationCompleted += (_, e) => { navigationSucceeded = e.IsSuccess; navigationStatus = $"{e.IsSuccess}/{e.WebErrorStatus}"; };
+            int navigationHttpStatus = 0;
+            browser.CoreWebView2.NavigationCompleted += (_, e) =>
+            {
+                navigationSucceeded = e.IsSuccess;
+                navigationHttpStatus = e.HttpStatusCode;
+                navigationStatus = $"{e.IsSuccess}/{e.WebErrorStatus}";
+            };
             browser.CoreWebView2.WebResourceResponseReceived += async (_, e) =>
             {
+                if (closingBrowser || cancellationToken.IsCancellationRequested) return;
                 try
                 {
                     if (Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var endpoint) && endpoint.Host == "api.bilibili.com" && endpoint.AbsolutePath.EndsWith("/playurl") && e.Response.StatusCode == 200)
                     {
                         using var stream = await e.Response.GetContentAsync();
+                        if (closingBrowser || stream == null) return;
                         using var reader = new StreamReader(stream);
-                        networkPlayInfo = await reader.ReadToEndAsync();
+                        networkPlayInfo = await reader.ReadToEndAsync(cancellationToken);
                     }
                 }
-                catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or ObjectDisposedException or IOException) { }
+                catch (Exception ex) when (closingBrowser || ex is System.Runtime.InteropServices.COMException or ObjectDisposedException or IOException) { }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
             };
             browser.CoreWebView2.Navigate(url);
             var deadline = DateTime.UtcNow.AddSeconds(55);
             var reloadAt = DateTime.UtcNow.AddSeconds(25);
             bool reloaded = false;
+            bool receivedMediaData = false;
             ResolvedVideo? best = null;
             DateTime? foundAt = null;
             while (DateTime.UtcNow < deadline)
@@ -91,16 +123,20 @@ public sealed class BrowserResolver
                     // One bounded page reload handles transient incomplete page loads.
                     networkPlayInfo = null;
                     navigationSucceeded = null;
+                    navigationHttpStatus = 0;
                     browser.CoreWebView2.Reload();
                     reloaded = true;
                     continue;
                 }
+                TimeSpan remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero) break;
                 string snapshot;
                 try
                 {
-                    snapshot = await browser.ExecuteScriptAsync("JSON.stringify({state:window.__INITIAL_STATE__||null,play:window.__playinfo__||null,url:location.href,userAgent:navigator.userAgent,title:document.title})");
+                    snapshot = await WaitForBrowserAsync(browser.ExecuteScriptAsync("JSON.stringify({state:window.__INITIAL_STATE__||null,play:window.__playinfo__||null,url:location.href,userAgent:navigator.userAgent,title:document.title})"), cancellationToken, remaining);
                 }
                 catch (System.Runtime.InteropServices.COMException) { continue; }
+                catch (TimeoutException ex) { throw new DownloadInterruptedException("等待视频页面响应超时，请检查网络或稍后重试。", ex); }
                 string? content = JsonSerializer.Deserialize<string>(snapshot);
                 if (string.IsNullOrEmpty(content)) continue;
                 using var document = JsonDocument.Parse(content);
@@ -110,9 +146,10 @@ public sealed class BrowserResolver
                 JsonElement play = data.GetProperty("play");
                 using var network = networkPlayInfo == null ? null : JsonDocument.Parse(networkPlayInfo);
                 if (play.ValueKind != JsonValueKind.Object && network != null) play = network.RootElement;
-                if (play.ValueKind != JsonValueKind.Object || !play.TryGetProperty("data", out var media)) continue;
+                if (play.ValueKind != JsonValueKind.Object || !play.TryGetProperty("data", out var media) || media.ValueKind != JsonValueKind.Object) continue;
                 var state = data.GetProperty("state");
                 if (!state.TryGetProperty("videoData", out var video)) continue;
+                receivedMediaData = true;
                 var resolved = ConvertPage(url, data.GetProperty("url").GetString()!, video, media, data.GetProperty("userAgent").GetString()!);
                 if (network != null && network.RootElement.TryGetProperty("data", out var networkMedia) && networkMedia.ValueKind == JsonValueKind.Object)
                 {
@@ -127,15 +164,51 @@ public sealed class BrowserResolver
                     if ((!useAccountSession && string.IsNullOrWhiteSpace(cookieFile)) || best.Info.Heights.Max() >= 1080 || DateTime.UtcNow - foundAt.Value > TimeSpan.FromSeconds(8)) return best;
                 }
             }
+            cancellationToken.ThrowIfCancellationRequested();
             if (navigationSucceeded != true)
-                throw new IOException($"B站视频页面连接失败或加载超时，尚未取得下载地址。请检查网络、DNS 或代理设置后重试。导航={navigationStatus}");
+            {
+                if (navigationHttpStatus is >= 400 and < 500 and not 408)
+                    throw new IOException($"B站视频页面拒绝了请求（HTTP {navigationHttpStatus}），尚未取得下载地址。");
+                throw new DownloadInterruptedException($"B站视频页面连接失败或加载超时，尚未取得下载地址。请检查网络、DNS 或代理设置后重试。导航={navigationStatus}");
+            }
+            if (!receivedMediaData)
+                throw new DownloadInterruptedException($"视频页面已加载，但播放器暂未返回资源数据。请检查网络或稍后重试。\n{lastPage}；导航={navigationStatus}");
             throw new InvalidOperationException($"视频页面已加载，但未取得可缓存资源。可能是页面资源加载不完整、需要登录或页面验证，或该视频暂时不可用。\n{lastPage}；导航={navigationStatus}");
         }
         catch (WebView2RuntimeNotFoundException)
         {
             throw new InvalidOperationException("缺少 Microsoft Edge WebView2 Runtime。请从微软官网安装后重新打开 BiliCache：https://developer.microsoft.com/microsoft-edge/webview2/");
         }
-        finally { browser?.Dispose(); host?.Close(); Gate.Release(); }
+        finally
+        {
+            closingBrowser = true;
+            try { browser?.Dispose(); }
+            finally
+            {
+                try { host?.Close(); }
+                finally { Gate.Release(); }
+            }
+        }
+    }
+
+    internal static async Task WaitForBrowserAsync(Task operation, CancellationToken cancellationToken, TimeSpan? timeout = null)
+    {
+        try { await operation.WaitAsync(timeout ?? BrowserOperationTimeout, cancellationToken); }
+        catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+        {
+            // WebView2 may complete after the caller has stopped waiting and disposed its view.
+            _ = operation.ContinueWith(static faulted => { _ = faulted.Exception; }, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            if (ex is TimeoutException) throw new TimeoutException("等待浏览器响应超时，请稍后重试。", ex);
+            throw;
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    internal static async Task<T> WaitForBrowserAsync<T>(Task<T> operation, CancellationToken cancellationToken, TimeSpan? timeout = null)
+    {
+        await WaitForBrowserAsync((Task)operation, cancellationToken, timeout);
+        return await operation;
     }
 
     public static ResolvedVideo? ConvertPage(string requestedUrl, string pageUrl, JsonElement video, JsonElement media, string userAgent)
@@ -161,7 +234,9 @@ public sealed class BrowserResolver
             throw new InvalidOperationException("当前页面返回的媒体时长短于完整视频，可能需要登录。");
         var headers = new Dictionary<string, string> { ["Referer"] = canonical, ["User-Agent"] = userAgent };
         var formats = new List<Dictionary<string, object?>>();
+        var mediaTracks = new List<MediaTrack>();
         var heights = new List<int>();
+        string contentId = bvid + "_p" + page;
         if (media.TryGetProperty("dash", out var dash))
         {
             foreach (string kind in new[] { "video", "audio" })
@@ -175,10 +250,35 @@ public sealed class BrowserResolver
                     int height = kind == "video" ? track.GetProperty("height").GetInt32() : 0;
                     if (height > 0) heights.Add(height);
                     string codec = track.GetProperty("codecs").GetString()!;
+                    string id = track.GetProperty("id").ToString();
+                    string formatId = kind + "-" + id + "-" + index++;
+                    string extension = kind == "video" ? "mp4" : "m4a";
+                    var primary = new Uri(source!);
+                    var urls = new List<Uri> { primary };
+                    var backups = TrackProperty(track, "backupUrl", "backup_url");
+                    if (backups.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var backup in backups.EnumerateArray())
+                        {
+                            if (backup.ValueKind == JsonValueKind.String && IsMediaUrl(backup.GetString()))
+                                urls.Add(new Uri(backup.GetString()!));
+                        }
+                    }
+                    var segment = TrackProperty(track, "SegmentBase", "segment_base");
+                    if (segment.ValueKind == JsonValueKind.Undefined) segment = TrackProperty(track, "segmentBase");
+                    string identity = JsonSerializer.Serialize(new[]
+                    {
+                        contentId, kind, id, codec, primary.AbsolutePath,
+                        TrackProperty(track, "bandwidth").ToString(), TrackProperty(track, "width").ToString(),
+                        TrackProperty(track, "height").ToString(), TrackProperty(track, "frameRate", "frame_rate").ToString(),
+                        TrackProperty(track, "size").ToString(), TrackProperty(segment, "Initialization", "initialization").ToString(),
+                        TrackProperty(segment, "indexRange", "index_range").ToString()
+                    });
+                    mediaTracks.Add(new MediaTrack(formatId, extension, identity, urls.Distinct().Take(3).ToArray()));
                     formats.Add(new Dictionary<string, object?>
                     {
-                        ["format_id"] = kind + "-" + track.GetProperty("id") + "-" + index++, ["url"] = source,
-                        ["ext"] = kind == "video" ? "mp4" : "m4a", ["protocol"] = "https",
+                        ["format_id"] = formatId, ["url"] = source,
+                        ["ext"] = extension, ["protocol"] = "https",
                         ["vcodec"] = kind == "video" ? codec : "none", ["acodec"] = kind == "audio" ? codec : "none",
                         ["height"] = height > 0 ? height : null,
                         ["width"] = kind == "video" ? track.GetProperty("width").GetInt32() : null,
@@ -190,11 +290,23 @@ public sealed class BrowserResolver
         }
         if (formats.Count == 0) return null;
         if (!formats.Any(f => (string?)f["vcodec"] == "none") || !formats.Any(f => (string?)f["acodec"] == "none")) return null;
-        string json = JsonSerializer.Serialize(new { id = bvid + "_p" + page, title, uploader, duration, webpage_url = canonical, extractor = "BiliCacheBrowser", extractor_key = "BiliBili", formats, http_headers = headers });
-        return new ResolvedVideo(new VideoInfo(canonical, title, uploader, duration, heights.Distinct().OrderDescending().ToList()), json);
+        string json = JsonSerializer.Serialize(new { id = contentId, title, uploader, duration, webpage_url = canonical, extractor = "BiliCacheBrowser", extractor_key = "BiliBili", formats, http_headers = headers });
+        return new ResolvedVideo(new VideoInfo(canonical, title, uploader, duration, heights.Distinct().OrderDescending().ToList()), json)
+        {
+            ContentId = contentId,
+            UserAgent = userAgent,
+            Tracks = mediaTracks
+        };
     }
 
-    private static bool IsMediaUrl(string? url) => Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == "https" && uri.IsDefaultPort && uri.UserInfo.Length == 0 &&
+    private static JsonElement TrackProperty(JsonElement track, string name, string? alias = null)
+    {
+        if (track.ValueKind != JsonValueKind.Object) return default;
+        if (track.TryGetProperty(name, out var value)) return value;
+        return alias != null && track.TryGetProperty(alias, out value) ? value : default;
+    }
+
+    internal static bool IsMediaUrl(string? url) => Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == "https" && uri.IsDefaultPort && uri.UserInfo.Length == 0 &&
         (uri.Host.EndsWith(".bilivideo.com", StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith(".bilivideo.cn", StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith(".biliapi.net", StringComparison.OrdinalIgnoreCase));
 
     private static void ImportCookies(CoreWebView2 core, string file)

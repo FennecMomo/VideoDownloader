@@ -9,12 +9,14 @@ namespace BiliCache;
 
 public partial class CacheWindow : Window
 {
+    private static readonly int[] RetryDelays = [3, 10, 30];
     public ObservableCollection<CacheJob> Jobs { get; } = [];
     private readonly Storage storage = new();
     private readonly DownloadService service = new();
     private Settings settings = new();
     private VideoInfo? video;
     private CancellationTokenSource? analyzeCancellation, downloadCancellation;
+    private readonly CancellationTokenSource accountCancellation = new();
     private CacheJob? currentJob;
     private bool running, shuttingDown, allowClose;
     private Task? queueTask, analysisTask, accountTask;
@@ -28,8 +30,7 @@ public partial class CacheWindow : Window
             DownloadFolderBox.Text = settings.DownloadDirectory; CookieBox.Text = settings.CookieFile; ToolsBox.Text = settings.ToolsDirectory;
             try
             {
-                var savedAccount = new AccountSession().Load();
-                if (savedAccount != null && settings.CookieFile.Length == 0)
+                if (settings.CookieFile.Length == 0 && new AccountSession().Load() is { } savedAccount)
                 {
                     settings.UseAccountSession = true; settings.AccountName = savedAccount.Account.Name;
                 }
@@ -38,18 +39,21 @@ public partial class CacheWindow : Window
             RefreshAccountStatus();
             foreach (var job in storage.Load("jobs.json", new List<CacheJob>()))
             {
-                if (job.State is "缓存中" or "等待中") { job.State = "已中断"; job.Detail = "上次程序退出，可选中后继续缓存"; }
+                if (job.State is "缓存中" or "等待重试" or "待续传" or "已中断")
+                {
+                    job.State = "等待中"; job.Detail = "等待自动续传";
+                }
                 if (job.State == "已完成" && !File.Exists(job.FilePath)) { job.State = "文件丢失"; job.Detail = "本地文件已移动或删除，可重新缓存"; }
                 Jobs.Add(job);
             }
-            CheckTools();
+            if (CheckTools()) StartQueue();
         }
         catch (Exception ex) { ShowError(ex); }
     }
-    private void CheckTools()
+    private bool CheckTools()
     {
-        try { DownloadService.ValidateTools(settings); EngineStatus.Text = "● 下载组件已就绪"; }
-        catch (Exception ex) { EngineStatus.Text = "● 请配置下载组件"; StatusText.Text = ex.Message; }
+        try { DownloadService.ValidateTools(settings); EngineStatus.Text = "● 下载组件已就绪"; return true; }
+        catch (Exception ex) { EngineStatus.Text = "● 请配置下载组件"; StatusText.Text = ex.Message; return false; }
     }
     private void UrlBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
@@ -87,7 +91,7 @@ public partial class CacheWindow : Window
     private void Add_Click(object sender, RoutedEventArgs e)
     {
         if (video == null || QualityBox.SelectedItem is not QualityOption quality) return;
-        if (Jobs.Any(j => j.Url == video.Url && j.Height == quality.Height && j.State is "等待中" or "缓存中")) { StatusText.Text = "相同的视频和清晰度已在队列中。"; return; }
+        if (Jobs.Any(j => j.Url == video.Url && j.Height == quality.Height && j.State is "等待中" or "缓存中" or "等待重试" or "待续传")) { StatusText.Text = "相同的视频和清晰度已在队列中。"; return; }
         var job = new CacheJob { Url = video.Url, Title = video.Title, Height = quality.Height };
         job.Folder = Path.Combine(settings.DownloadDirectory, job.Id);
         Jobs.Insert(0, job); JobsList.SelectedItem = job; Persist(); StartQueue();
@@ -102,35 +106,75 @@ public partial class CacheWindow : Window
             {
                 currentJob = job;
                 using var cancellation = new CancellationTokenSource();
-                downloadCancellation = cancellation; job.State = "缓存中"; job.Detail = "正在连接 B 站…"; Persist();
+                downloadCancellation = cancellation;
                 try
                 {
                     var snapshot = new Settings { DownloadDirectory = settings.DownloadDirectory, CookieFile = settings.CookieFile, ToolsDirectory = settings.ToolsDirectory, UseAccountSession = settings.UseAccountSession };
-                    job.FilePath = await service.DownloadAsync(job, snapshot, new Progress<DownloadUpdate>(p => { if (job.State != "缓存中") return; job.Progress = p.Percent; job.Detail = p.Detail; }), cancellation.Token);
+                    string path = await DownloadWithRetryAsync(job, snapshot, cancellation.Token);
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    job.FilePath = path;
                     job.State = "已完成"; job.Progress = 100; job.Detail = $"已缓存 · {new FileInfo(job.FilePath).Length / 1048576d:F1} MB · 可离线播放";
                     StatusText.Text = $"缓存完成：{job.Title}";
                 }
-                catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { job.State = "已取消"; job.Detail = DownloadService.CancellationDetail(job.Folder); }
+                catch (Exception) when (shuttingDown) { }
+                catch (Exception) when (cancellation.IsCancellationRequested) { job.State = "已取消"; job.Detail = DownloadService.CancellationDetail(job.Folder); }
+                catch (DownloadInterruptedException ex)
+                {
+                    job.State = "待续传";
+                    job.Detail = $"自动重试已用完。可手动继续，或下次启动时自动续传。\n{ex.Message}";
+                    StatusText.Text = "缓存因网络问题中断，已保留下载数据。";
+                }
                 catch (OperationCanceledException) { job.State = "失败"; job.Detail = "网络请求超时，未完成缓存。请检查网络或代理设置后重试。"; StatusText.Text = job.Detail; }
                 catch (LoginExpiredException ex) { job.State = "失败"; job.Detail = ex.Message; AccountStatus.Text = "登录已失效 · 请重新登录"; StatusText.Text = ex.Message; }
                 catch (Exception ex) { job.State = "失败"; job.Detail = ex.Message; StatusText.Text = "缓存失败。选中任务后可重试，悬停说明可查看详情。"; }
-                finally { downloadCancellation = null; currentJob = null; Persist(); }
+                finally { downloadCancellation = null; currentJob = null; if (!shuttingDown) Persist(); }
             }
         }
         finally { running = false; }
+    }
+
+    private async Task<string> DownloadWithRetryAsync(CacheJob job, Settings snapshot, CancellationToken cancellationToken)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            job.State = "缓存中"; job.Detail = "正在连接 B 站…"; Persist();
+            var progress = new Progress<DownloadUpdate>(update =>
+            {
+                if (shuttingDown || job.State != "缓存中") return;
+                job.Progress = update.Percent; job.Detail = update.Detail;
+            });
+            try { return await service.DownloadAsync(job, snapshot, progress, cancellationToken); }
+            catch (DownloadInterruptedException ex) when (attempt < RetryDelays.Length)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int seconds = RetryDelays[attempt];
+                job.State = "等待重试";
+                job.Detail = $"{seconds} 秒后自动续传（{attempt + 1}/{RetryDelays.Length}）。\n{ex.Message}";
+                Persist();
+                await Task.Delay(TimeSpan.FromSeconds(seconds), cancellationToken);
+            }
+        }
     }
     private CacheJob? Selected() => JobsList.SelectedItem as CacheJob;
     private void Retry_Click(object sender, RoutedEventArgs e)
     {
         if (Selected() is not { } job) { StatusText.Text = "请先选择一个缓存任务。"; return; }
-        if (job.State is "缓存中" or "等待中" or "已完成") { StatusText.Text = "此任务无需重试。"; return; }
-        job.State = "等待中"; job.Detail = "等待继续缓存"; job.Progress = 0; Persist(); StartQueue();
+        if (job == currentJob || job.State is "缓存中" or "等待中" or "等待重试" or "已完成") { StatusText.Text = "此任务无需重试。"; return; }
+        job.State = "等待中"; job.Detail = "等待继续缓存"; Persist(); StartQueue();
     }
     private void CancelJob_Click(object sender, RoutedEventArgs e)
     {
         if (Selected() is not { } job) return;
-        if (job == currentJob) { job.Detail = "正在停止…"; downloadCancellation?.Cancel(); }
-        else if (job.State == "等待中") { job.State = "已取消"; job.Detail = "任务已取消，可重新加入队列"; Persist(); }
+        if (job == currentJob)
+        {
+            job.State = "已取消"; job.Detail = "正在停止缓存，可手动继续。"; Persist();
+            _ = downloadCancellation?.CancelAsync();
+        }
+        else if (job.State is "等待中" or "待续传")
+        {
+            job.State = "已取消"; job.Detail = "任务已取消，可手动继续。"; Persist();
+        }
     }
     private void Remove_Click(object sender, RoutedEventArgs e)
     {
@@ -161,7 +205,7 @@ public partial class CacheWindow : Window
     private async void Login_Click(object sender, RoutedEventArgs e)
     {
         if (running || analyzeCancellation != null) { StatusText.Text = "请等当前解析或缓存结束后再登录或切换账号。"; return; }
-        var window = new AccountWindow { Owner = this };
+        var window = new AccountWindow { Owner = this, Icon = Icon };
         if (window.ShowDialog() == true && window.Account is { } account)
         {
             try
@@ -188,12 +232,13 @@ public partial class CacheWindow : Window
         IsEnabled = false;
         try
         {
-            await AccountWindow.ClearSessionAsync();
+            await AccountWindow.ClearSessionAsync(accountCancellation.Token);
             settings.UseAccountSession = false; settings.AccountName = ""; settings.CookieFile = ""; CookieBox.Text = "";
             storage.Save("settings.json", settings); service.ClearResolved();
             video = null; AddButton.IsEnabled = false; QualityBox.IsEnabled = false;
             RefreshAccountStatus(); StatusText.Text = "工具内的登录会话已清除，缓存文件保留。";
         }
+        catch (OperationCanceledException) when (accountCancellation.IsCancellationRequested) { }
         catch (Exception ex) { ShowError(ex); }
         finally { if (!shuttingDown) IsEnabled = true; }
     }
@@ -219,10 +264,11 @@ public partial class CacheWindow : Window
             Directory.CreateDirectory(folder);
             var updated = new Settings { DownloadDirectory = Path.GetFullPath(folder), CookieFile = CookieBox.Text.Trim(), ToolsDirectory = ToolsBox.Text.Trim(), UseAccountSession = settings.UseAccountSession, AccountName = settings.AccountName };
             if (updated.CookieFile.Length > 0 && !File.Exists(updated.CookieFile)) throw new FileNotFoundException("所选 Cookie 文件不存在。");
-            storage.Save("settings.json", updated); settings = updated; StatusText.Text = "设置已保存，对后续解析和缓存生效。"; CheckTools();
+            storage.Save("settings.json", updated); settings = updated; StatusText.Text = "设置已保存，对后续解析和缓存生效。";
             service.ClearResolved();
             RefreshAccountStatus();
             video = null; AddButton.IsEnabled = false; QualityBox.IsEnabled = false;
+            if (CheckTools()) StartQueue();
         }
         catch (Exception ex) { ShowError(ex); }
     }
@@ -231,11 +277,38 @@ public partial class CacheWindow : Window
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
         if (allowClose) return;
-        e.Cancel = true; if (shuttingDown) return;
-        shuttingDown = true; IsEnabled = false; analyzeCancellation?.Cancel(); downloadCancellation?.Cancel();
-        if (analysisTask != null) await analysisTask;
-        if (queueTask != null) await queueTask;
-        if (accountTask != null) await accountTask;
-        Player.Dispose(); Persist(); allowClose = true; Close();
+        if (shuttingDown) { e.Cancel = true; return; }
+        shuttingDown = true;
+        Task[] active = new[] { analysisTask, queueTask, accountTask }.OfType<Task>().Where(task => !task.IsCompleted).ToArray();
+        if (active.Length == 0)
+        {
+            accountCancellation.Dispose();
+            return;
+        }
+
+        e.Cancel = true;
+        IsEnabled = false;
+        // Resume states are already on disk. Yield before attempting a second Close, even if cancellation completes inline.
+        Task cleanup = Task.WhenAll(active.Append(analyzeCancellation?.CancelAsync() ?? Task.CompletedTask)
+            .Append(downloadCancellation?.CancelAsync() ?? Task.CompletedTask).Append(accountCancellation.CancelAsync()));
+        await System.Windows.Threading.Dispatcher.Yield();
+        try
+        {
+            Hide();
+            await cleanup.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        catch (Exception ex) { Debug.WriteLine(ex); }
+        finally
+        {
+            if (cleanup.IsCompleted) accountCancellation.Dispose();
+            allowClose = true;
+            Close();
+        }
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        Player.Dispose();
+        base.OnClosed(e);
     }
 }

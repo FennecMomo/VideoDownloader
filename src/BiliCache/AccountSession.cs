@@ -53,16 +53,18 @@ public sealed class AccountSession
             !cookie.Value.Any(c => char.IsControl(c) || c == ';') &&
             (cookie.Expires <= 0 || cookie.Expires > DateTimeOffset.UtcNow.ToUnixTimeSeconds());
     }
-    public static async Task<List<SessionCookie>> CaptureAsync(CoreWebView2 core)
+    public static async Task<List<SessionCookie>> CaptureAsync(CoreWebView2 core, CancellationToken cancellationToken = default)
     {
-        var cookies = await core.CookieManager.GetCookiesAsync(VerifyUri.AbsoluteUri);
+        cancellationToken.ThrowIfCancellationRequested();
+        var cookies = await BrowserResolver.WaitForBrowserAsync(core.CookieManager.GetCookiesAsync(VerifyUri.AbsoluteUri), cancellationToken);
         return cookies.Select(c => new SessionCookie(c.Name, c.Value, c.Domain, c.Path, c.IsSecure, c.IsHttpOnly,
             c.IsSession ? 0 : new DateTimeOffset(c.Expires.ToUniversalTime()).ToUnixTimeSeconds())).Where(IsAllowed).ToList();
     }
-    public async Task RestoreAsync(CoreWebView2 core)
+    public async Task RestoreAsync(CoreWebView2 core, CancellationToken cancellationToken = default)
     {
         // Prefer cookies refreshed by Bilibili in the live app profile over an older saved copy.
-        if ((await CaptureAsync(core)).Any(c => c.Name == "SESSDATA")) return;
+        if ((await CaptureAsync(core, cancellationToken)).Any(c => c.Name == "SESSDATA")) return;
+        cancellationToken.ThrowIfCancellationRequested();
         var saved = Load();
         if (saved == null) return;
         foreach (var item in saved.Cookies.Where(IsAllowed))
@@ -84,7 +86,7 @@ public sealed class AccountSession
         request.Headers.TryAddWithoutValidation("User-Agent", userAgent);
         request.Headers.Referrer = new Uri("https://www.bilibili.com/");
         using var response = await NetworkRequest.SendAsync(Client, request, cancellationToken);
-        if (!response.IsSuccessStatusCode) throw new HttpRequestException($"暂时无法验证 B站账号（HTTP {(int)response.StatusCode}），已保留登录状态，请稍后重试。");
+        if (!response.IsSuccessStatusCode) throw new HttpRequestException($"暂时无法验证 B站账号（HTTP {(int)response.StatusCode}），已保留登录状态，请稍后重试。", null, response.StatusCode);
         return ParseIdentity(await response.Content.ReadAsStringAsync(cancellationToken));
     }
     public static AccountIdentity? ParseIdentity(string json)

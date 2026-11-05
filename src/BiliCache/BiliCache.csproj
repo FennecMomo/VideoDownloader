@@ -6,10 +6,12 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <ApplicationIcon>Assets\BiliCache.ico</ApplicationIcon>
     <Version>0.4.1</Version>
   </PropertyGroup>
 
   <ItemGroup>
+    <Resource Include="Assets\BiliCache.ico" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
   </ItemGroup>
 

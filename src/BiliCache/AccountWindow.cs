@@ -27,18 +27,25 @@ public sealed class AccountWindow : Window
         DockPanel.SetDock(reload, Dock.Right); bar.Children.Add(reload); bar.Children.Add(status);
         DockPanel.SetDock(bar, Dock.Top); panel.Children.Add(bar); panel.Children.Add(browser); Content = panel;
         Loaded += InitializeAsync;
-        Closed += (_, _) => { closed = true; lifetime.Cancel(); browser.Dispose(); };
+        Closed += (_, _) =>
+        {
+            closed = true;
+            lifetime.Cancel();
+            try { browser.Dispose(); }
+            finally { lifetime.Dispose(); }
+        };
     }
     private async void InitializeAsync(object sender, RoutedEventArgs e)
     {
+        if (closed) return;
+        var cancellationToken = lifetime.Token;
         try
         {
-            var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: BrowserResolver.ProfilePath("", true));
-            lifetime.Token.ThrowIfCancellationRequested();
-            await browser.EnsureCoreWebView2Async(environment);
-            lifetime.Token.ThrowIfCancellationRequested();
+            var environment = await BrowserResolver.WaitForBrowserAsync(CoreWebView2Environment.CreateAsync(userDataFolder: BrowserResolver.ProfilePath("", true)), cancellationToken);
+            await BrowserResolver.WaitForBrowserAsync(browser.EnsureCoreWebView2Async(environment), cancellationToken);
             var session = new AccountSession();
-            await session.RestoreAsync(browser.CoreWebView2);
+            await session.RestoreAsync(browser.CoreWebView2, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             browser.CoreWebView2.IsMuted = true;
             browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
             browser.CoreWebView2.Settings.IsPasswordAutosaveEnabled = false;
@@ -57,12 +64,14 @@ public sealed class AccountWindow : Window
                 if (IsBiliPage(args.Uri)) browser.CoreWebView2.Navigate(args.Uri);
             };
             browser.CoreWebView2.Navigate("https://passport.bilibili.com/login");
-            while (!lifetime.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
-                    var cookies = await AccountSession.CaptureAsync(browser.CoreWebView2);
-                    var account = await AccountSession.VerifyAsync(cookies, browser.CoreWebView2.Settings.UserAgent, lifetime.Token);
+                    var cookies = await AccountSession.CaptureAsync(browser.CoreWebView2, cancellationToken);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var account = await AccountSession.VerifyAsync(cookies, browser.CoreWebView2.Settings.UserAgent, cancellationToken);
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (account != null)
                     {
                         session.Save(new SavedSession(account, cookies));
@@ -72,13 +81,13 @@ public sealed class AccountWindow : Window
                     }
                     status.Text = navigationError ?? "等待登录：在官方页面扫码或登录，成功后会自动保存并返回。";
                 }
-                catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { return; }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
                 catch (Exception ex) when (!closed)
                 {
                     status.Text = navigationError ?? (ex is TimeoutException or System.Net.Http.HttpRequestException ? ex.Message : "暂时无法确认或保存账号，稍后自动重试。请保持窗口打开。");
-                    await Task.Delay(7000, lifetime.Token);
+                    await Task.Delay(7000, cancellationToken);
                 }
-                await Task.Delay(3000, lifetime.Token);
+                await Task.Delay(3000, cancellationToken);
             }
         }
         catch (OperationCanceledException) { }
@@ -86,19 +95,25 @@ public sealed class AccountWindow : Window
     }
     private static bool IsBiliPage(string url) => Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == "https" && uri.IsDefaultPort && uri.UserInfo.Length == 0 && (uri.Host == "bilibili.com" || uri.Host.EndsWith(".bilibili.com", StringComparison.OrdinalIgnoreCase));
 
-    public static async Task ClearSessionAsync()
+    public static async Task ClearSessionAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var browser = new WebView2();
         var host = new Window { Content = browser, Width = 100, Height = 100, ShowActivated = false, ShowInTaskbar = false, Opacity = 0 };
         try
         {
             host.Show();
-            var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: BrowserResolver.ProfilePath("", true));
-            await browser.EnsureCoreWebView2Async(environment);
-            await browser.CoreWebView2.Profile.ClearBrowsingDataAsync(CoreWebView2BrowsingDataKinds.AllProfile);
-            if ((await AccountSession.CaptureAsync(browser.CoreWebView2)).Any(c => c.Name == "SESSDATA")) throw new InvalidOperationException("登录会话仍在使用，请稍后重试退出。");
+            var environment = await BrowserResolver.WaitForBrowserAsync(CoreWebView2Environment.CreateAsync(userDataFolder: BrowserResolver.ProfilePath("", true)), cancellationToken);
+            await BrowserResolver.WaitForBrowserAsync(browser.EnsureCoreWebView2Async(environment), cancellationToken);
+            await BrowserResolver.WaitForBrowserAsync(browser.CoreWebView2.Profile.ClearBrowsingDataAsync(CoreWebView2BrowsingDataKinds.AllProfile), cancellationToken);
+            if ((await AccountSession.CaptureAsync(browser.CoreWebView2, cancellationToken)).Any(c => c.Name == "SESSDATA")) throw new InvalidOperationException("登录会话仍在使用，请稍后重试退出。");
+            cancellationToken.ThrowIfCancellationRequested();
             new AccountSession().Forget();
         }
-        finally { browser.Dispose(); host.Close(); }
+        finally
+        {
+            try { browser.Dispose(); }
+            finally { host.Close(); }
+        }
     }
 }
