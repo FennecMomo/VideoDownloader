@@ -3,6 +3,8 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
 using Microsoft.Win32;
 
 namespace BiliCache;
@@ -50,10 +52,10 @@ public partial class CacheWindow : Window
         }
         catch (Exception ex) { ShowError(ex); }
     }
-    private bool CheckTools()
+    private bool CheckTools(TextBlock? feedback = null)
     {
         try { DownloadService.ValidateTools(settings); EngineStatus.Text = "● 下载组件已就绪"; return true; }
-        catch (Exception ex) { EngineStatus.Text = "● 请配置下载组件"; StatusText.Text = ex.Message; return false; }
+        catch (Exception ex) { EngineStatus.Text = "● 请配置下载组件"; (feedback ?? StatusText).Text = ex.Message; return false; }
     }
     private void UrlBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
@@ -194,17 +196,36 @@ public partial class CacheWindow : Window
         catch (OperationCanceledException) { }
         catch (Exception ex) { ShowError(ex); }
     }
-    private void MainTabs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    private void MainTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (e.Source != MainTabs || PlayerTab == null || NewCacheCard == null) return;
-        bool playingTab = MainTabs.SelectedItem == PlayerTab;
-        NewCacheCard.Visibility = playingTab ? Visibility.Collapsed : Visibility.Visible;
-        if (!playingTab && Player != null && Player.IsPlaying) Player.Pause();
+        if (e.Source != MainTabs || MainTabs.SelectedItem == PlayerTab || Player is not { } player) return;
+        player.EndKeyboardSeek();
+        if (player.IsPlaying) player.Pause();
+    }
+
+    protected override void OnPreviewKeyDown(KeyEventArgs e)
+    {
+        base.OnPreviewKeyDown(e);
+        if (!e.Handled && MainTabs?.SelectedItem == PlayerTab && Player is { } player &&
+            (e.OriginalSource is not TabItem tab || tab == PlayerTab) && player.HandlePlayerKeyDown(e))
+            e.Handled = true;
+    }
+
+    protected override void OnPreviewKeyUp(KeyEventArgs e)
+    {
+        base.OnPreviewKeyUp(e);
+        if (Player?.HandleSeekKeyUp(e) == true) e.Handled = true;
+    }
+
+    protected override void OnDeactivated(EventArgs e)
+    {
+        Player?.EndKeyboardSeek();
+        base.OnDeactivated(e);
     }
     private void RefreshAccountStatus() => AccountStatus.Text = !string.IsNullOrWhiteSpace(settings.CookieFile) ? "使用导入的 Cookie 文件" : settings.UseAccountSession ? $"已保存账号：{settings.AccountName} · 解析时验证有效性" : "未登录 · 使用公开清晰度";
     private async void Login_Click(object sender, RoutedEventArgs e)
     {
-        if (running || analyzeCancellation != null) { StatusText.Text = "请等当前解析或缓存结束后再登录或切换账号。"; return; }
+        if (running || analyzeCancellation != null) { SettingsStatusText.Text = "请等当前解析或缓存结束后再登录或切换账号。"; return; }
         var window = new AccountWindow { Owner = this, Icon = Icon };
         if (window.ShowDialog() == true && window.Account is { } account)
         {
@@ -215,15 +236,15 @@ public partial class CacheWindow : Window
                 storage.Save("settings.json", settings);
                 service.ClearResolved(); video = null; AddButton.IsEnabled = false; QualityBox.IsEnabled = false;
                 AccountStatus.Text = $"已登录：{account.Name} · 已自动保存";
-                StatusText.Text = "账号已保存，后续自动使用此账号获取视频资源。";
+                SettingsStatusText.Text = "账号已保存，后续自动使用此账号获取视频资源。";
                 if (!string.IsNullOrWhiteSpace(UrlBox.Text)) { analysisTask = AnalyzeAsync(); await analysisTask; }
             }
-            catch (Exception ex) { ShowError(ex); }
+            catch (Exception ex) { ShowError(ex, SettingsStatusText); }
         }
     }
     private async void Logout_Click(object sender, RoutedEventArgs e)
     {
-        if (running || analyzeCancellation != null) { StatusText.Text = "请等当前解析或缓存结束后再退出账号。"; return; }
+        if (running || analyzeCancellation != null) { SettingsStatusText.Text = "请等当前解析或缓存结束后再退出账号。"; return; }
         accountTask = LogoutAsync();
         await accountTask;
     }
@@ -236,10 +257,10 @@ public partial class CacheWindow : Window
             settings.UseAccountSession = false; settings.AccountName = ""; settings.CookieFile = ""; CookieBox.Text = "";
             storage.Save("settings.json", settings); service.ClearResolved();
             video = null; AddButton.IsEnabled = false; QualityBox.IsEnabled = false;
-            RefreshAccountStatus(); StatusText.Text = "工具内的登录会话已清除，缓存文件保留。";
+            RefreshAccountStatus(); SettingsStatusText.Text = "工具内的登录会话已清除，缓存文件保留。";
         }
         catch (OperationCanceledException) when (accountCancellation.IsCancellationRequested) { }
-        catch (Exception ex) { ShowError(ex); }
+        catch (Exception ex) { ShowError(ex, SettingsStatusText); }
         finally { if (!shuttingDown) IsEnabled = true; }
     }
     private void OpenFolder_Click(object sender, RoutedEventArgs e)
@@ -264,16 +285,20 @@ public partial class CacheWindow : Window
             Directory.CreateDirectory(folder);
             var updated = new Settings { DownloadDirectory = Path.GetFullPath(folder), CookieFile = CookieBox.Text.Trim(), ToolsDirectory = ToolsBox.Text.Trim(), UseAccountSession = settings.UseAccountSession, AccountName = settings.AccountName };
             if (updated.CookieFile.Length > 0 && !File.Exists(updated.CookieFile)) throw new FileNotFoundException("所选 Cookie 文件不存在。");
-            storage.Save("settings.json", updated); settings = updated; StatusText.Text = "设置已保存，对后续解析和缓存生效。";
+            storage.Save("settings.json", updated); settings = updated; SettingsStatusText.Text = "设置已保存，对后续解析和缓存生效。";
             service.ClearResolved();
             RefreshAccountStatus();
             video = null; AddButton.IsEnabled = false; QualityBox.IsEnabled = false;
-            if (CheckTools()) StartQueue();
+            if (CheckTools(SettingsStatusText)) StartQueue();
         }
-        catch (Exception ex) { ShowError(ex); }
+        catch (Exception ex) { ShowError(ex, SettingsStatusText); }
     }
     private void Persist() { try { storage.Save("jobs.json", Jobs.ToList()); } catch (Exception ex) { StatusText.Text = "任务历史保存失败：" + ex.Message; } }
-    private void ShowError(Exception ex) { StatusText.Text = ex.Message.Split('\n')[0]; if (!shuttingDown) MessageBox.Show(this, ex.Message, "BiliCache", MessageBoxButton.OK, MessageBoxImage.Information); }
+    private void ShowError(Exception ex, TextBlock? feedback = null)
+    {
+        (feedback ?? StatusText).Text = ex.Message.Split('\n')[0];
+        if (!shuttingDown) MessageBox.Show(this, ex.Message, "BiliCache", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
         if (allowClose) return;
